@@ -1,0 +1,147 @@
+---
+title: "How well? - Human Activity Recognition"
+author: "Zsolt Olah"
+date: 'March 18th, 2018'
+output: html_document
+---
+
+```{r setup, include=FALSE}
+Sys.setlocale("LC_ALL","English")
+setwd("C:/Users/Zso/Desktop/rq/C8W4/assign")
+
+library(caret); library(nnet); library(ranger)
+```
+
+## Introduction  
+
+In the following analysis, we are going to build a prediction model using the [Human Activity Recognition database](http://groupware.les.inf.puc-rio.br/har). Our goal is to predict the manner of a given physical exercise based on accelerometer data.  
+  
+## Preprocessing  
+  
+For further considerations, we split the original training data into **train** and a **cross valiation** partition, which consist a 20% random sample (appr. 3900 obs.) of the initial training data.  
+Looking at the data, one might notice the following crucial data characteristics:
+    -- there are many factor variables, some of them identifies the users of the accelerometers, the time of the measurement, and some numeric values also encoded into factor variables, presumably due to the high number of missing values (and hence low variability);
+    -- the share of missing data is relatively high across the variables, and in many cases, the occurence seems non-random.  
+    
+Based on the above, we decided to incorporate those numeric variables with a low number of missing values. Moreover, factor variables describing the subjects and the measurement time considered irrelevant in evaluating the class of physical exercises (e.g. **X, user_name, time stamps, new_window**).  
+
+```{r 1_load, echo=FALSE, cache=TRUE}
+    training <- read.csv("pml-training.csv", header=TRUE)
+    testing <- read.csv("pml-testing.csv", header=TRUE)
+
+    set.seed(58911)
+    inCV <- createDataPartition(training$classe, p = 1/5)[[1]]
+    
+    CVing <- training[inCV,]
+    train <- training[-inCV,]
+```
+  
+Since there is two type of variables respecting the proportion of the NA values (see Fig. below), only those with zero count of NAs will be considered.  
+```{r 2_prepoc, echo=FALSE, fig.align='center', out.width='60%'}
+
+    # Choosing numeric variables with low number of NAs
+    nas <- apply(train,2,function(x){sum(is.na(x))/length(x)})
+    q <- qplot(nas, ylab="Relative frequency", 
+               xlab="Share of NAs", main="Frequency of the NA-ratios")
+    q
+    
+    nas <- (nas==0)
+  
+    num <- sapply(train,is.numeric)
+    ids <- nas & num
+    
+    # Deselecting irrelevant numeric variables
+    irrel <- c("X", "raw_timestamp_part_1", "raw_timestamp_part_2", "num_window")
+    ids[irrel] <- FALSE
+    ids2 <- ids
+    ids["classe"] <- TRUE
+```
+At the end of the variable *pre*-selection, we have 52 numeric features and variable **classe** as a categorical variable for the classification exercise.  
+  
+## Building predictive models
+  
+For further exploration, we assess the correlation among the pre-selected features. As seen on the heatmap below, some variables have high pairwise correlation. In order to handle possible multicollinearity, we generate the principal components of the features.
+
+```{r 3_correl_pca, echo=FALSE, fig.align='center', out.width='60%'}
+  # plotting the correaltaion heatmap   
+    M <- cor(train[,ids2])
+
+    heatmap(1-M, Rowv=NA, Colv=NA, symm=TRUE, revC=TRUE, col=heat.colors(20,alpha=0.8),
+          labRow=NA, labCol=NA, main="Correlation heatmap", xlab="Variables", 
+          ylab="Variables", margins=c(1.4,1.4))
+  
+  #Preprocessing PCA  
+    pre_pca <- preProcess(train[,ids2], method="pca")
+
+    df <- data.frame(Cum.var=cumsum(diag(var(predict(pre_pca, train[,ids2])))) / 
+      sum(diag(var(predict(pre_pca, train[,ids2])))))
+    t(df)
+```
+We are going to try 3 model specifications:  
+    i) one which to be trained on the principal components that explains 99% of the total variance using **multinomial logit**;  
+    ii) model trained on the original data using **multinomial logit**;  
+    iii) model trained on the original data with **classification trees**.  
+These specifications are going to be tested and then ensembled with **random forests** on the cross validation set. Finally, the ensembled model is going to be assessed on the original test set.
+
+```{r 4_train, echo=TRUE, cache=TRUE, results="hide"}
+    ctrl <- trainControl(method="boot", number=10)
+    ctrl2 <- trainControl(method="boot", number=50)
+
+    op <- predict(pre_pca, train[,ids2])
+    train_ <- data.frame(op[,1:24], classe=train$classe)
+    model_pca <- train(classe ~., data=train_, method="multinom", trControl=ctrl)
+    
+    model_compl <- train(classe ~., data=train[,ids], method="multinom", trControl=ctrl)
+    
+    model_tree <- train(classe ~., data=train[,ids], method="rpart", trControl=ctrl2)
+```
+
+## Evaluating predictions - Predcition ensembling
+
+```{r 5_ensemb, include=FALSE}
+    op <- predict(pre_pca, CVing[,ids2])
+    CV_pca <- data.frame(op, classe=CVing$classe)
+    
+    pred_pca <- predict(model_pca,CV_pca)
+    pred_compl <- predict(model_compl,CVing[,ids])
+    pred_tree <- predict(model_tree,CVing[,ids])
+    
+    conf_pca <- confusionMatrix(pred_pca, CV_pca$classe)
+    conf_compl <- confusionMatrix(pred_compl, CVing$classe)
+    conf_tree <- confusionMatrix(pred_tree, CVing$classe)
+```
+
+Assessing the performance of each model, we could summarize the specifications as the followings.
+    -- Accuracy for the PCA model is: `r round(conf_pca$overall[1]*100,1)`%
+    -- Accuracy for the complete multinomial model is: `r round(conf_compl$overall[1]*100,1)`%
+    -- Accuracy for tree model is: `r round(conf_tree$overall[1]*100,1)`%
+
+Now, we estimate the accuracy of an ensembled predictor based on the predictions of the above models. To ensemble, random forest are built using the **ranger** package.  
+
+```{r 6_predict, echo=FALSE}
+    
+    # CV data
+
+    df_ranger=data.frame(pred_pca=pred_pca, pred_compl=pred_compl,
+                         pred_tree=pred_tree, classe=CVing$classe)
+    
+    model_rf=train(classe ~., data=df_ranger, method="ranger")
+
+    pred_rf <- predict(model_rf,df_ranger)
+    conf_rf <- confusionMatrix(pred_rf, CVing$classe)
+    
+    # For the test data
+    
+    test_pca <- predict(pre_pca, testing[,ids2])
+    
+    pred_pca2 <- predict(model_pca,test_pca)
+    pred_compl2 <- predict(model_compl,testing[,ids2])
+    pred_tree2 <- predict(model_tree,testing[,ids2])
+    
+    df_ranger2 <- data.frame(pred_pca=pred_pca2, pred_compl=pred_compl2,
+                         pred_tree=pred_tree2)
+    
+    pred_rf2 <- predict(model_rf,df_ranger2)
+```
+
+Accuracy of the random forest on the CV dataset: `r round(conf_rf$overall[1]*100,1)`% (which is an in-sample accuracy along out-of-sample predictors).
